@@ -7,7 +7,7 @@ from meross_iot.controller.mixins.light import LightMixin
 from meross_iot.controller.mixins.diffuser_light import DiffuserLightMixin
 from meross_iot.manager import MerossManager
 from meross_iot.model.http.device import HttpDeviceInfo
-from meross_iot.model.enums import DiffuserLightMode
+from meross_iot.model.enums import DiffuserLightMode, LightMode
 import homeassistant.util.color as color_util
 from homeassistant.components.light import LightEntity
 from homeassistant.components.light import ColorMode, \
@@ -144,16 +144,19 @@ class LightEntityWrapper(MerossDevice, LightEntity):
         # Color is taken from either of these 2 values, but not both.
         if ATTR_RGB_COLOR in kwargs:
             await self._device.async_set_light_color(channel=self._channel_id, rgb=kwargs[ATTR_RGB_COLOR], onoff=True, skip_rate_limits=True)
+            self._set_local_capacity(LightMode.MODE_RGB)
         elif ATTR_HS_COLOR in kwargs:
             h, s = kwargs[ATTR_HS_COLOR]
             rgb = color_util.color_hsv_to_RGB(h, s, 100)
             _LOGGER.debug("color change: rgb=%r -- h=%r s=%r" % (rgb, h, s))
             await self._device.async_set_light_color(channel=self._channel_id, rgb=rgb, onoff=True, skip_rate_limits=True)
+            self._set_local_capacity(LightMode.MODE_RGB)
         elif ATTR_COLOR_TEMP_KELVIN in kwargs:
             kelvin = kwargs[ATTR_COLOR_TEMP_KELVIN]
             temperature = _kelvin_to_meross_temperature(kelvin)
             _LOGGER.debug("temperature change: kelvin=%r meross=%r" % (kelvin, temperature))
             await self._device.async_set_light_color(channel=self._channel_id, temperature=temperature, skip_rate_limits=True)
+            self._set_local_capacity(LightMode.MODE_TEMPERATURE)
 
         # Brightness must always be set, so take previous luminance if not explicitly set now.
         if ATTR_BRIGHTNESS in kwargs:
@@ -189,10 +192,43 @@ class LightEntityWrapper(MerossDevice, LightEntity):
 
         return None
 
+    def _light_info(self):
+        status = getattr(self._device, "_channel_light_status", None)
+        if isinstance(status, dict):
+            return status.get(self._channel_id)
+        return None
+
+    def _current_capacity(self) -> Optional[int]:
+        """Active mode bitmask (1=RGB, 2=temperature, 4=luminance), as last set through HA.
+        meross_iot 0.4.9.2 discards the capacity field from device pushes, so changes made
+        from the Meross app are not reflected here."""
+        info = self._light_info()
+        return getattr(info, "_capacity", None) if info is not None else None
+
+    def _set_local_capacity(self, mode: LightMode) -> None:
+        """Record the active mode locally; the low-level lib never stores it."""
+        info = self._light_info()
+        if info is None:
+            return
+        capacity = mode.value
+        if self._device.get_supports_luminance(channel=self._channel_id):
+            capacity |= LightMode.MODE_LUMINANCE.value
+        try:
+            info.update(capacity=capacity)
+        except Exception:  # pragma: no cover - defensive against lib changes
+            _LOGGER.debug("Unable to update local light capacity", exc_info=True)
+
     @property
     def color_mode(self) -> ColorMode | str | None:
         """Return the color mode of the light."""
-        # TODO: we need support from low-level library in order to keep track of mode that haas been set.
+        capacity = self._current_capacity()
+        if capacity:
+            if capacity & LightMode.MODE_RGB.value and self._device.get_supports_rgb(channel=self._channel_id):
+                return ColorMode.RGB
+            if capacity & LightMode.MODE_TEMPERATURE.value and self._device.get_supports_temperature(channel=self._channel_id):
+                return ColorMode.COLOR_TEMP
+
+        # Fallback when the device hasn't reported its active mode yet.
         if self._device.get_supports_rgb(channel=self._channel_id):
             return ColorMode.RGB
         elif self._device.get_supports_luminance(channel=self._channel_id):
@@ -200,6 +236,13 @@ class LightEntityWrapper(MerossDevice, LightEntity):
         if self._device.get_supports_temperature(channel=self._channel_id):
             return ColorMode.COLOR_TEMP
         return ColorMode.ONOFF
+
+    @property
+    def rgb_color(self):
+        rgb = self._device.get_rgb_color(channel=self._channel_id)
+        if rgb is not None and isinstance(rgb, tuple) and len(rgb) == 3:
+            return rgb
+        return None
 
     @property
     def hs_color(self):
